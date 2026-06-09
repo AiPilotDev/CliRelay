@@ -1,6 +1,5 @@
 # Зависимости Node.js
 node_modules/
-package-lock.json
 yarn.lock
 
 # Данные сессии и кэш
