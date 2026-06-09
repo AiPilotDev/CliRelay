@@ -10,7 +10,9 @@ RUN apt-get update \
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     CHROME_PATH=/usr/bin/chromium \
-    NODE_ENV=production
+    NODE_ENV=production \
+    SKIP_ACCOUNT_MENU=true \
+    NON_INTERACTIVE=true
 
 WORKDIR /app
 
