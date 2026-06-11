@@ -1,7 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 
-import { initBrowser, shutdownBrowser } from './src/browser/browser.js';
 import apiRoutes from './src/api/routes.js';
 import { getAvailableModelsFromFile, getApiKeys } from './src/api/chat.js';
 import { loadTokens } from './src/api/tokenManager.js';
@@ -89,8 +88,7 @@ process.on('uncaughtException', async (error) => {
 });
 
 async function handleShutdown() {
-    logInfo('\nПолучен сигнал завершения. Закрываем браузер...');
-    await shutdownBrowser();
+    logInfo('\nПолучен сигнал завершения.');
     logInfo('Завершение работы.');
     process.exit(0);
 }
@@ -160,12 +158,6 @@ async function startServer() {
         ensureNonInteractiveTokens();
     }
 
-    const browserInitialized = await initBrowser(false);
-    if (!browserInitialized) {
-        logError('Не удалось инициализировать браузер. Завершение работы.');
-        process.exit(1);
-    }
-
     try {
         app.listen(port, host, () => {
             const displayHost = host === '0.0.0.0' ? 'localhost' : host;
@@ -201,7 +193,6 @@ async function startServer() {
     } catch (err) {
         if (err.code === 'EADDRINUSE') {
             logError(`Порт ${port} уже используется. Возможно, сервер уже запущен.`);
-            await shutdownBrowser();
             process.exit(1);
         }
         throw err;
@@ -210,6 +201,5 @@ async function startServer() {
 
 startServer().catch(async error => {
     logError('Ошибка при запуске сервера', error);
-    await shutdownBrowser();
     process.exit(1);
 });

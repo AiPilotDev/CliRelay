@@ -228,6 +228,7 @@ const buildModelMapping = () => {
 };
 
 export const MODEL_MAPPING = buildModelMapping();
+const AVAILABLE_MODEL_SET = new Set(Object.values(MODEL_MAPPING));
 
 /**
  * Получить соответствующую доступную модель
@@ -244,8 +245,7 @@ export function getMappedModel(requestedModel, defaultModel = DEFAULT_MODEL) {
     }
 
     // Проверяем, является ли запрошенная модель уже доступной
-    const availableModels = Object.values(MODEL_MAPPING);
-    if (availableModels.includes(requestedModel)) {
+    if (AVAILABLE_MODEL_SET.has(requestedModel)) {
         return requestedModel;
     }
 

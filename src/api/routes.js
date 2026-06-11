@@ -1,7 +1,5 @@
 import express from 'express';
-import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken } from './chat.js';
-import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
-import { checkAuthentication } from '../browser/auth.js';
+import { sendMessage, getAllModels, getOpenAIModels, getApiKeys, isValidApiKey, createChatV2, pollQwenTaskStatus, extractMediaUrl } from './chat.js';
 import { logInfo, logError, logDebug } from '../logger/index.js';
 import { getMappedModel } from './modelMapping.js';
 import { getStsToken, uploadFileToQwen } from './fileUpload.js';
@@ -186,7 +184,6 @@ async function resolveQwenChatId(effectiveChatId, mappedModel) {
 
     return qwenChatId;
 }
-import { testToken } from './chat.js';
 
 function isOpenWebUiMetaRequest(messages) {
     if (!Array.isArray(messages) || messages.length === 0) return false;
@@ -302,7 +299,7 @@ function authMiddleware(req, res, next) {
     }
 
     const token = authHeader.substring(7).trim();
-    if (!apiKeys.includes(token)) {
+    if (!isValidApiKey(token)) {
         logError('Предоставлен недействительный API ключ');
         return res.status(401).json({ error: 'Недействительный токен' });
     }
@@ -910,20 +907,24 @@ router.get('/health', async (req, res) => {
         const modelData = getAllModels();
         const tokens = listTokens();
         const now = Date.now();
-        const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
+        const accountStats = tokens.reduce((stats, token) => {
+            if (token.invalid) {
+                stats.invalid++;
+            } else if (token.resetAt && Date.parse(token.resetAt) > now) {
+                stats.waiting++;
+            } else {
+                stats.available++;
+            }
+            return stats;
+        }, { total: tokens.length, available: 0, invalid: 0, waiting: 0 });
 
         res.json({
-            ok: availableAccounts > 0,
+            ok: accountStats.available > 0,
             service: 'FreeQwenApi',
             watermark: FORGETMEAI_WATERMARK,
             baseUrl: '/api',
             models: modelData.models.length,
-            accounts: {
-                total: tokens.length,
-                available: availableAccounts,
-                invalid: tokens.filter(t => t.invalid).length,
-                waiting: tokens.filter(t => t.resetAt && new Date(t.resetAt).getTime() > now).length
-            },
+            accounts: accountStats,
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -935,17 +936,7 @@ router.get('/health', async (req, res) => {
 router.get('/models', async (req, res) => {
     try {
         logInfo('Запрос на получение списка моделей');
-        const modelsRaw = getAllModels();
-        const openAiModels = {
-            object: 'list',
-            data: modelsRaw.models.map(m => ({
-                id: m.id || m.name || m,
-                object: 'model',
-                created: 0,
-                owned_by: 'qwen',
-                permission: []
-            }))
-        };
+        const openAiModels = getOpenAIModels();
         logInfo(`Возвращено ${openAiModels.data.length} моделей (OpenAI формат)`);
         res.json(openAiModels);
     } catch (error) {
@@ -958,34 +949,22 @@ router.get('/status', async (req, res) => {
     try {
         logInfo('Запрос статуса авторизации');
         const tokens = listTokens();
-        const accounts = await Promise.all(tokens.map(async t => {
-            const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
-
-            if (t.resetAt) {
-                const resetTime = new Date(t.resetAt).getTime();
-                if (resetTime > Date.now()) { accInfo.status = 'WAIT'; return accInfo; }
-            }
-
-            const testResult = await testToken(t.token);
-            if (testResult === 'OK') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-            else if (testResult === 'RATELIMIT') { accInfo.status = 'WAIT'; markRateLimited(t.id, 24); }
-            else if (testResult === 'UNAUTHORIZED') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
-            else { accInfo.status = 'ERROR'; }
-            return accInfo;
-        }));
-
-        const browserContext = getBrowserContext();
-        if (!browserContext) {
-            logError('Браузер не инициализирован');
-            return res.json({ authenticated: false, message: 'Браузер не инициализирован', accounts });
-        }
-
-        if (getAuthenticationStatus()) return res.json({ accounts });
-
-        await checkAuthentication(browserContext);
-        const isAuthenticated = getAuthenticationStatus();
-        logInfo(`Статус авторизации: ${isAuthenticated ? 'активна' : 'требуется авторизация'}`);
-        res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Авторизация активна' : 'Требуется авторизация', accounts });
+        const now = Date.now();
+        const accountsFromTokens = tokens.map(t => {
+            const waiting = Boolean(t.resetAt && Date.parse(t.resetAt) > now);
+            return {
+                id: t.id,
+                status: t.invalid ? 'INVALID' : waiting ? 'WAIT' : 'OK',
+                resetAt: t.resetAt || null
+            };
+        });
+        const authenticatedFromTokens = accountsFromTokens.some(account => account.status === 'OK');
+        return res.json({
+            authenticated: authenticatedFromTokens,
+            auth: 'token-manager',
+            message: authenticatedFromTokens ? 'Available token found' : 'No available tokens',
+            accounts: accountsFromTokens
+        });
     } catch (error) {
         logError('Ошибка при проверке статуса авторизации', error);
         res.status(500).json({ error: 'Внутренняя ошибка сервера' });
@@ -2046,7 +2025,7 @@ router.get('/images/status', async (req, res) => {
         const dashScopeAvailable = await checkImageApiAvailability();
         const tokens = listTokens();
         const now = Date.now();
-        const qwenChatAvailable = tokens.some(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+        const qwenChatAvailable = tokens.some(t => (!t.resetAt || Date.parse(t.resetAt) <= now) && !t.invalid);
 
         res.json({
             watermark: FORGETMEAI_WATERMARK,
@@ -2077,7 +2056,7 @@ router.get('/images/status', async (req, res) => {
 router.get('/videos/status', async (req, res) => {
     const tokens = listTokens();
     const now = Date.now();
-    const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
+    const availableAccounts = tokens.filter(t => (!t.resetAt || Date.parse(t.resetAt) <= now) && !t.invalid).length;
     res.json({
         watermark: FORGETMEAI_WATERMARK,
         available: availableAccounts > 0,
