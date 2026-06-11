@@ -1,4 +1,4 @@
-import { getAvailableToken, getAvailableTokenById, markRateLimited, removeInvalidToken } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -9,7 +9,7 @@ import {
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
-    RATE_LIMIT_HOURS
+    RATE_LIMIT_HOURS, USER_AGENT
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,22 +25,61 @@ let availableModelResponse = null;
 let openAIModelResponse = null;
 let authKeys = null;
 let authKeySet = null;
-const chatTokenMap = new Map();
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-function bindChatToToken(chatId, tokenObj) {
-    if (chatId && tokenObj?.id) {
-        chatTokenMap.set(chatId, tokenObj.id);
+function getQwenOrigin() {
+    try {
+        return new URL(CHAT_PAGE_URL).origin;
+    } catch {
+        return 'https://chat.qwen.ai';
     }
 }
 
-function unbindChatToken(chatId) {
-    if (chatId) chatTokenMap.delete(chatId);
+function buildQwenHeaders(token, referer = CHAT_PAGE_URL) {
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Accept': '*/*',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Origin': getQwenOrigin(),
+        'Referer': referer,
+        'User-Agent': USER_AGENT
+    };
 }
 
-function getBoundTokenId(chatId) {
-    return chatId ? chatTokenMap.get(chatId) : null;
+async function readQwenResponse(response) {
+    const bodyText = await response.text();
+    const trimmed = bodyText.trim();
+    let data = null;
+
+    if (trimmed) {
+        try {
+            data = JSON.parse(trimmed);
+        } catch {
+            data = null;
+        }
+    }
+
+    return { bodyText, data };
+}
+
+function compactLogValue(value, maxLength = 500) {
+    if (value === null || value === undefined || value === '') return 'no details';
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function extractCreatedChatId(data) {
+    return data?.data?.id || data?.chat_id || data?.id || null;
+}
+
+function isWafChallengeBody(body) {
+    const text = String(body || '').toLowerCase();
+    return text.includes('aliyun_waf') ||
+        text.includes('x5sec') ||
+        text.includes('waf') && text.includes('<html') ||
+        text.includes('punish') && text.includes('aliyun');
 }
 
 // ─── Page helpers ────────────────────────────────────────────────────────────
@@ -236,23 +275,11 @@ function validateAndPrepareMessage(message) {
     return { error: 'Неподдерживаемый формат сообщения' };
 }
 
-async function resolveAuthToken(chatId = null) {
-    const boundTokenId = getBoundTokenId(chatId);
-    if (boundTokenId) {
-        const boundToken = getAvailableTokenById(boundTokenId);
-        if (boundToken?.token) {
-            authToken = boundToken.token;
-            logInfo(`Using pinned account ${boundToken.id} for chat ${chatId}`);
-            return boundToken;
-        }
-        logWarn(`Pinned account ${boundTokenId} for chat ${chatId} is unavailable, unpinning chat`);
-        unbindChatToken(chatId);
-    }
-
+async function resolveAuthToken() {
     const tokenObj = await getAvailableToken();
     if (tokenObj?.token) {
         authToken = tokenObj.token;
-        logInfo(`???????????? ???????: ${tokenObj.id}`);
+        logInfo(`Используется аккаунт: ${tokenObj.id}`);
         return tokenObj;
     }
 
@@ -406,11 +433,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         const response = await fetch(apiUrl, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`,
-                'Accept': '*/*'
-            },
+            headers: buildQwenHeaders(token, `${getQwenOrigin()}/c/${payload.chat_id}`),
             body: JSON.stringify(payload)
         });
 
@@ -428,12 +451,34 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('text/event-stream')) {
-            return parseNonSseCompletionBody(await response.text());
+            const body = await response.text();
+            if (isWafChallengeBody(body)) {
+                return {
+                    success: false,
+                    status: response.status,
+                    statusText: response.statusText,
+                    wafChallenge: true,
+                    error: 'Qwen returned Aliyun WAF challenge HTML.',
+                    errorBody: body
+                };
+            }
+            return parseNonSseCompletionBody(body);
         }
 
         const reader = response.body?.getReader?.();
         if (!reader) {
-            return parseNonSseCompletionBody(await response.text());
+            const body = await response.text();
+            if (isWafChallengeBody(body)) {
+                return {
+                    success: false,
+                    status: response.status,
+                    statusText: response.statusText,
+                    wafChallenge: true,
+                    error: 'Qwen returned Aliyun WAF challenge HTML.',
+                    errorBody: body
+                };
+            }
+            return parseNonSseCompletionBody(body);
         }
 
         const decoder = new TextDecoder();
@@ -534,7 +579,6 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     }
 
     if (response.status === 403 && response.errorBody && (response.errorBody.includes('FAIL_SYS_USER_VALIDATE') || response.errorBody.includes('captcha'))) {        authToken = null;
-        unbindChatToken(chatId);
         return {
             error: 'Qwen requires verification/captcha for this account or request.',
             verification: true,
@@ -545,15 +589,13 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
         logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
-        authToken = null;        unbindChatToken(chatId);
+        authToken = null;
         if (tokenObj?.id) {
             const { markInvalid } = await import('./tokenManager.js');
             markInvalid(tokenObj.id);
         }
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            // chatId/parentId сбрасываем: при смене аккаунта старый чат
-            // принадлежит прежнему токену и под новым «не существует».
             return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
         logError('Не осталось валидных токенов или исчерпаны попытки.');
@@ -572,11 +614,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         }
 
         authToken = null;
-        unbindChatToken(chatId);
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            // chatId/parentId сбрасываем: при смене аккаунта старый чат
-            // принадлежит прежнему токену и под новым «не существует».
             return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
@@ -599,7 +638,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     // Резолвим аккаунт ОДИН раз: одним и тем же токеном создаём чат и
     // отправляем сообщение — иначе round-robin разнесёт их по разным
     // аккаунтам и Qwen вернёт «chat is not exist».
-    const tokenObj = await resolveAuthToken(chatId);
+    const tokenObj = await resolveAuthToken();
     if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
     const requestToken = tokenObj.token;
@@ -608,7 +647,6 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
         if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
         chatId = newChatResult.chatId;
-        bindChatToToken(chatId, tokenObj);
         logInfo(`Создан новый чат v2 с ID: ${chatId}`);
     }
 
@@ -699,7 +737,6 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         if (response.success) {
             logRaw(JSON.stringify(response.data));
             logInfo('Ответ получен успешно');
-            bindChatToToken(chatId, tokenObj);
             response.data.chatId = chatId;
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
@@ -807,21 +844,33 @@ async function createChatWithNodeFetch(payload, token) {
 
         const response = await fetch(CREATE_CHAT_URL, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json'
-            },
+            headers: buildQwenHeaders(token),
             body: JSON.stringify(payload)
         });
+        const { bodyText, data } = await readQwenResponse(response);
 
-        if (response.ok) {
-            return { success: true, data: await response.json() };
+        if (isWafChallengeBody(bodyText)) {
+            return {
+                success: false,
+                status: response.status,
+                statusText: response.statusText,
+                wafChallenge: true,
+                error: 'Qwen returned Aliyun WAF challenge HTML for the token-only request.',
+                errorBody: bodyText
+            };
         }
 
-        return { success: false, status: response.status, errorBody: await response.text() };
+        if (response.ok) {
+            return { success: true, status: response.status, statusText: response.statusText, data, body: bodyText };
+        }
+
+        return { success: false, status: response.status, statusText: response.statusText, errorBody: bodyText, data };
     } catch (error) {
-        return { success: false, error: error.toString() };
+        return {
+            success: false,
+            error: error.message || error.toString(),
+            cause: error.cause?.code || error.cause?.message || null
+        };
     }
 }
 
@@ -843,23 +892,29 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         const payload = { title, models: [model], chat_mode: 'normal', chat_type: chatType, timestamp: Date.now() };
         let result = await createChatWithNodeFetch(payload, requestToken);
 
-        if (result.success && result.data.success) {
-            logInfo(`Чат создан: ${result.data.data.id}`);
-            bindChatToToken(result.data.data.id, tokenObj);
-            return { success: true, chatId: result.data.data.id, requestId: result.data.request_id, tokenId: tokenObj?.id };
+        const createdChatId = result.success ? extractCreatedChatId(result.data) : null;
+        if (createdChatId) {
+            logInfo(`Чат создан: ${createdChatId}`);
+            return { success: true, chatId: createdChatId, requestId: result.data?.request_id, tokenId: tokenObj?.id };
         }
 
-        const isTransient = result.status >= 500 && result.status < 600;
+        const isNetworkError = !result.status && Boolean(result.error);
+        const isTransient = isNetworkError || (result.status >= 500 && result.status < 600);
         if (isTransient && retryCount < MAX_RETRY_COUNT) {
-            logWarn(`Создание чата: ${result.status}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`);
+            logWarn(`Создание чата: ${result.status || result.error || 'network error'}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`);
             await delay(RETRY_DELAY);
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj);
         }
 
-        const cleanError = isTransient
-            ? `Qwen API недоступен (${result.status}). Повторите позже.`
-            : (result.errorBody || result.error || 'Неизвестная ошибка');
-        logError(`Ошибка при создании чата: ${result.status || 'unknown'} (попытка ${retryCount + 1})`);
+        const cleanError = result.wafChallenge
+            ? 'Qwen вернул Aliyun WAF challenge вместо JSON для token-only запроса.'
+            : isTransient
+            ? `Qwen API недоступен (${result.status || result.error}). Повторите позже.`
+            : (result.errorBody || result.error || result.body || 'Неизвестная ошибка');
+        const detail = result.wafChallenge
+            ? 'Aliyun WAF challenge HTML'
+            : (result.errorBody || result.error || result.body || result.data || result.statusText || result.cause);
+        logError(`Ошибка при создании чата: ${result.status || result.error || 'unknown'} (попытка ${retryCount + 1}); details=${compactLogValue(detail)}`);
         return { error: cleanError };
     } catch (error) {
         logError('Ошибка при создании чата', error);
