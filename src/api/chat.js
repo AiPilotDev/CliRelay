@@ -5,11 +5,11 @@ import { fileURLToPath } from 'url';
 import { logInfo, logError, logWarn, logDebug, logRaw } from '../logger/index.js';
 import crypto from 'crypto';
 import {
-    CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
-    PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
+    CHAT_API_URL, CREATE_CHAT_URL, TASK_STATUS_URL,
+    RETRY_DELAY,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
-    RATE_LIMIT_HOURS, USER_AGENT
+    RATE_LIMIT_HOURS
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,23 +28,23 @@ let authKeySet = null;
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-function getQwenOrigin() {
-    try {
-        return new URL(CHAT_PAGE_URL).origin;
-    } catch {
-        return 'https://chat.qwen.ai';
-    }
+function buildQwenHeaders(token) {
+    return {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Version': '0.2.63',
+        'source': 'desktop',
+        'Timezone': new Date().toString().replace(/\s*\(.+\)$/, ''),
+        'X-Request-Id': crypto.randomUUID(),
+        'X-Accel-Buffering': 'no'
+    };
 }
 
-function buildQwenHeaders(token, referer = CHAT_PAGE_URL) {
+function buildQwenStreamingHeaders(token) {
     return {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-        'Accept': '*/*',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Origin': getQwenOrigin(),
-        'Referer': referer,
-        'User-Agent': USER_AGENT
+        ...buildQwenHeaders(token),
+        'Accept': 'text/event-stream, application/json'
     };
 }
 
@@ -288,16 +288,16 @@ async function resolveAuthToken() {
 
 function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null) {
     const userMessageId = crypto.randomUUID();
-    const assistantChildId = crypto.randomUUID();
 
     const isVideo = chatType === 't2v';
 
     const featureConfig = {
         thinking_enabled: isVideo,
-        output_schema: 'phase'
+        output_schema: 'phase',
+        research_mode: 'normal',
+        auto_search: false
     };
     if (isVideo) {
-        featureConfig.research_mode = 'normal';
         featureConfig.auto_thinking = true;
         featureConfig.thinking_format = 'summary';
         featureConfig.auto_search = true;
@@ -305,28 +305,29 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
 
     const newMessage = {
         fid: userMessageId,
-        parentId, parent_id: parentId,
+        childrenIds: [],
         role: 'user',
         content: messageContent,
-        chat_type: chatType, sub_chat_type: chatType,
-        timestamp: Math.floor(Date.now() / 1000),
         user_action: 'chat',
+        timestamp: Math.floor(Date.now() / 1000),
         models: [model],
-        files: files || [],
-        childrenIds: [assistantChildId],
+        chat_type: chatType,
+        feature_config: featureConfig,
         extra: { meta: { subChatType: chatType } },
-        feature_config: featureConfig
+        sub_chat_type: chatType
     };
+
+    if (files && files.length > 0) newMessage.files = files;
 
     const payload = {
         stream: !isVideo,
+        version: '2.1',
         incremental_output: true,
-        chat_id: chatId,
         chat_mode: 'normal',
-        messages: [newMessage],
         model,
-        parent_id: parentId,
-        timestamp: Math.floor(Date.now() / 1000)
+        chat_id: chatId,
+        timestamp: Math.floor(Date.now() / 1000),
+        messages: [newMessage]
     };
 
     if (size) payload.size = size;
@@ -345,8 +346,9 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
 
 function parseNonSseCompletionBody(body) {
     if (typeof body === 'string' && body.includes('data:')) {
-        let fullContent = '';
-        let responseId = null;
+        const responseOrder = [];
+        const responseIndexes = new Map();
+        const contentByResponseId = new Map();
         let usage = null;
 
         for (const rawLine of body.split('\n')) {
@@ -365,16 +367,30 @@ function parseNonSseCompletionBody(body) {
                     return { success: false, status: 500, errorBody: JSON.stringify(chunk) };
                 }
 
-                if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                if (chunk.response_id) responseId = chunk.response_id;
+                const created = chunk['response.created'];
+                if (created?.response_id) {
+                    responseOrder.push(created.response_id);
+                    responseIndexes.set(created.response_id, String(created.response_index ?? ''));
+                    continue;
+                }
                 if (chunk.usage) usage = chunk.usage;
 
                 const delta = chunk.choices?.[0]?.delta;
-                if (delta?.content) fullContent += delta.content;
+                if (delta?.phase && delta.phase !== 'answer') continue;
+                if (typeof delta?.content === 'string') {
+                    const responseId = chunk.response_id || 'default';
+                    if (!responseOrder.includes(responseId)) responseOrder.push(responseId);
+                    contentByResponseId.set(responseId, `${contentByResponseId.get(responseId) || ''}${delta.content}`);
+                }
             } catch {
                 // Ignore malformed SSE lines and keep parsing the rest.
             }
         }
+
+        const responseId = responseOrder.find(id => responseIndexes.get(id) === '0') ||
+            responseOrder.find(id => (contentByResponseId.get(id) || '').trim() !== '') ||
+            null;
+        const fullContent = responseId ? (contentByResponseId.get(responseId) || '') : '';
 
         if (fullContent || responseId) {
             return {
@@ -433,7 +449,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         const response = await fetch(apiUrl, {
             method: 'POST',
-            headers: buildQwenHeaders(token, `${getQwenOrigin()}/c/${payload.chat_id}`),
+            headers: buildQwenStreamingHeaders(token),
             body: JSON.stringify(payload)
         });
 
@@ -485,6 +501,8 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         let buffer = '';
         let fullContent = '';
         let responseId = null;
+        let primaryResponseId = null;
+        const responseIndexes = new Map();
         let usage = null;
         let finished = false;
         let streamError = null;
@@ -523,11 +541,24 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                         break;
                     }
 
-                    if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                    if (chunk.response_id) responseId = chunk.response_id;
+                    const created = chunk['response.created'];
+                    if (created?.response_id) {
+                        responseIndexes.set(created.response_id, String(created.response_index ?? ''));
+                        if (String(created.response_index ?? '') === '0' || !primaryResponseId) {
+                            primaryResponseId = created.response_id;
+                            responseId = created.response_id;
+                        }
+                        continue;
+                    }
 
                     const delta = chunk.choices?.[0]?.delta;
+                    if (delta?.phase && delta.phase !== 'answer') continue;
+                    const chunkResponseId = chunk.response_id || responseId || 'default';
+                    if (responseIndexes.size > 0 && primaryResponseId && chunkResponseId !== primaryResponseId) {
+                        continue;
+                    }
                     if (delta?.content) {
+                        responseId = chunkResponseId;
                         fullContent += delta.content;
                         if (typeof onChunk === 'function') {
                             onChunk(delta.content);
@@ -845,7 +876,7 @@ async function createChatWithNodeFetch(payload, token) {
         const response = await fetch(CREATE_CHAT_URL, {
             method: 'POST',
             headers: buildQwenHeaders(token),
-            body: JSON.stringify(payload)
+            body: JSON.stringify({})
         });
         const { bodyText, data } = await readQwenResponse(response);
 
